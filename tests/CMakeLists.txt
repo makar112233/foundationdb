@@ -210,6 +210,7 @@ if(WITH_PYTHON)
   add_fdb_test(TEST_FILES rare/CheckRelocation.toml)
   add_fdb_test(TEST_FILES rare/ClogUnclog.toml)
   add_fdb_test(TEST_FILES rare/CloggedCycleWithKills.toml)
+  add_fdb_test(TEST_FILES rare/ConfigDBUnitTest.toml)
   add_fdb_test(TEST_FILES rare/ConfigIncrement.toml)
   add_fdb_test(TEST_FILES rare/ConfigIncrementWithKills.toml)
   add_fdb_test(TEST_FILES rare/ConflictRangeCheck.toml)
@@ -388,6 +389,7 @@ if(WITH_PYTHON)
       NAME command_line_argument_test
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/argument_parsing/test_argument_parsing.py ${CMAKE_BINARY_DIR}
     )
+    set_tests_properties(command_line_argument_test PROPERTIES ENVIRONMENT "FDB_CLUSTER_FILE=${CMAKE_BINARY_DIR}/fdb.cluster")
   endif()
 
   verify_testing()
