@@ -534,10 +534,9 @@ const int VERSION_OVERHEAD =
          sizeof(Reference<VersionedMap<KeyRef, ValueOrClearToRef>::PTreeT>)); // versioned map [ x2 for
                                                                               // createNewVersion(version+1) ], 64b
                                                                               // overhead for map
-// For both the mutation log and the versioned map.
+
 static int mvccStorageBytes(MutationRef const& m) {
-	return VersionedMap<KeyRef, ValueOrClearToRef>::overheadPerItem * 2 +
-	       (MutationRef::OVERHEAD_BYTES + m.param1.size() + m.param2.size()) * 2;
+	return mvccStorageBytes(m.param1.size() + m.param2.size());
 }
 
 struct FetchInjectionInfo {
@@ -2126,7 +2125,7 @@ ACTOR Future<Void> getValueQ(StorageServer* data, GetValueRequest req) {
 
 		/*
 		StorageMetrics m;
-		m.bytesPerKSecond = req.key.size() + (v.present() ? v.get().size() : 0);
+		m.bytesWrittenPerKSecond = req.key.size() + (v.present() ? v.get().size() : 0);
 		m.iosPerKSecond = 1;
 		data->metrics.notify(req.key, m);
 		*/
@@ -2803,6 +2802,8 @@ ACTOR Future<std::pair<ChangeFeedStreamReply, bool>> getChangeFeedMutations(Stor
 	state Version emptyVersion = feedInfo->emptyVersion;
 	state Version durableValidationVersion = std::min(data->durableVersion.get(), feedInfo->durableFetchVersion.get());
 	Version fetchStorageVersion = std::max(feedInfo->fetchVersion, feedInfo->durableFetchVersion.get());
+	state bool doFilterMutations = !req.range.contains(feedInfo->range);
+	state bool doValidation = EXPENSIVE_VALIDATION;
 
 	if (DEBUG_CF_TRACE) {
 		TraceEvent(SevDebug, "TraceChangeFeedMutationsDetails", data->thisServerID)
@@ -2829,7 +2830,10 @@ ACTOR Future<std::pair<ChangeFeedStreamReply, bool>> getChangeFeedMutations(Stor
 			if (it->version >= req.end || it->version > dequeVersion || remainingLimitBytes <= 0) {
 				break;
 			}
-			auto m = filterMutations(memoryReply.arena, *it, req.range, inverted);
+			MutationsAndVersionRef m = *it;
+			if (doFilterMutations) {
+				m = filterMutations(memoryReply.arena, *it, req.range, inverted);
+			}
 			if (m.mutations.size()) {
 				memoryReply.arena.dependsOn(it->arena());
 				memoryReply.mutations.push_back(memoryReply.arena, m);
@@ -2873,7 +2877,6 @@ ACTOR Future<std::pair<ChangeFeedStreamReply, bool>> getChangeFeedMutations(Stor
 			data->checkChangeCounter(changeCounter, req.range);
 		}
 
-		// TODO eventually: only do verify in simulation?
 		int memoryVerifyIdx = 0;
 
 		Version lastVersion = req.begin - 1;
@@ -2886,7 +2889,7 @@ ACTOR Future<std::pair<ChangeFeedStreamReply, bool>> getChangeFeedMutations(Stor
 			std::tie(mutations, knownCommittedVersion) = decodeChangeFeedDurableValue(kv.value);
 
 			// gap validation
-			while (memoryVerifyIdx < memoryReply.mutations.size() &&
+			while (doValidation && memoryVerifyIdx < memoryReply.mutations.size() &&
 			       version > memoryReply.mutations[memoryVerifyIdx].version) {
 				if (req.canReadPopped) {
 					// There are weird cases where SS fetching mixed with SS durability and popping can mean there are
@@ -2925,19 +2928,21 @@ ACTOR Future<std::pair<ChangeFeedStreamReply, bool>> getChangeFeedMutations(Stor
 				}
 			}
 
-			auto m = filterMutations(
-			    reply.arena, MutationsAndVersionRef(mutations, version, knownCommittedVersion), req.range, inverted);
+			MutationsAndVersionRef m = MutationsAndVersionRef(mutations, version, knownCommittedVersion);
+			if (doFilterMutations) {
+				m = filterMutations(reply.arena, m, req.range, inverted);
+			}
 			if (m.mutations.size()) {
 				reply.arena.dependsOn(mutations.arena());
 				reply.mutations.push_back(reply.arena, m);
 
-				if (memoryVerifyIdx < memoryReply.mutations.size() &&
+				if (doValidation && memoryVerifyIdx < memoryReply.mutations.size() &&
 				    version == memoryReply.mutations[memoryVerifyIdx].version) {
 					// We could do validation of mutations here too, but it's complicated because clears can get split
 					// and stuff
 					memoryVerifyIdx++;
 				}
-			} else if (memoryVerifyIdx < memoryReply.mutations.size() &&
+			} else if (doValidation && memoryVerifyIdx < memoryReply.mutations.size() &&
 			           version == memoryReply.mutations[memoryVerifyIdx].version) {
 				if (version > durableValidationVersion) {
 					// Another validation case - feed was popped, data was fetched, fetched data was persisted but pop
@@ -5822,7 +5827,8 @@ void applyMutation(StorageServer* self,
 	// m is expected to be in arena already
 	// Clear split keys are added to arena
 	StorageMetrics metrics;
-	metrics.bytesPerKSecond = mvccStorageBytes(m) / 2;
+	// FIXME: remove the / 2 and double the related knobs.
+	metrics.bytesWrittenPerKSecond = mvccStorageBytes(m) / 2; // comparable to counter.bytesInput / 2
 	metrics.iosPerKSecond = 1;
 	self->metrics.notify(m.param1, metrics);
 
@@ -5889,14 +5895,21 @@ void applyChangeFeedMutation(StorageServer* self, MutationRef const& m, Version 
 			}
 		}
 	} else if (m.type == MutationRef::ClearRange) {
-		auto ranges = self->keyChangeFeed.intersectingRanges(KeyRangeRef(m.param1, m.param2));
+		KeyRangeRef mutationClearRange(m.param1, m.param2);
+		// FIXME: this might double-insert clears if the same feed appears in multiple sub-ranges
+		auto ranges = self->keyChangeFeed.intersectingRanges(mutationClearRange);
 		for (auto& r : ranges) {
 			for (auto& it : r.value()) {
 				if (version < it->stopVersion && !it->removing && version > it->emptyVersion) {
 					if (it->mutations.empty() || it->mutations.back().version != version) {
 						it->mutations.push_back(MutationsAndVersionRef(version, self->knownCommittedVersion.get()));
 					}
-					it->mutations.back().mutations.push_back_deep(it->mutations.back().arena(), m);
+
+					// clamp feed mutation to change feed range
+					KeyRangeRef clearIntersect = mutationClearRange & it->range;
+					it->mutations.back().mutations.push_back_deep(
+					    it->mutations.back().arena(),
+					    MutationRef(MutationRef::Type::ClearRange, clearIntersect.begin, clearIntersect.end));
 					self->currentChangeFeeds.insert(it->id);
 					self->addFeedBytesAtVersion(m.totalSize(), version);
 
@@ -8823,7 +8836,8 @@ ACTOR Future<Void> update(StorageServer* data, bool* pReceivedUpdate) {
 				} else {
 					MutationRef msg;
 					cloneReader >> msg;
-					if (isEncryptionOpSupported(EncryptOperationType::TLOG_ENCRYPTION) && !msg.isEncrypted() &&
+					if (g_network && g_network->isSimulated() &&
+					    isEncryptionOpSupported(EncryptOperationType::TLOG_ENCRYPTION) && !msg.isEncrypted() &&
 					    !(isSingleKeyMutation((MutationRef::Type)msg.type) &&
 					      (backupLogKeys.contains(msg.param1) || (applyLogKeys.contains(msg.param1))))) {
 						ASSERT(false);
@@ -8981,7 +8995,8 @@ ACTOR Future<Void> update(StorageServer* data, bool* pReceivedUpdate) {
 			} else {
 				MutationRef msg;
 				rd >> msg;
-				if (isEncryptionOpSupported(EncryptOperationType::TLOG_ENCRYPTION) && !msg.isEncrypted() &&
+				if (g_network && g_network->isSimulated() &&
+				    isEncryptionOpSupported(EncryptOperationType::TLOG_ENCRYPTION) && !msg.isEncrypted() &&
 				    !(isSingleKeyMutation((MutationRef::Type)msg.type) &&
 				      (backupLogKeys.contains(msg.param1) || (applyLogKeys.contains(msg.param1))))) {
 					ASSERT(false);
@@ -10200,11 +10215,11 @@ Future<bool> StorageServerDisk::restoreDurableState() {
 
 // Determines whether a key-value pair should be included in a byte sample
 // Also returns size information about the sample
-ByteSampleInfo isKeyValueInSample(KeyValueRef keyValue) {
+ByteSampleInfo isKeyValueInSample(const KeyRef key, int64_t totalKvSize) {
+	ASSERT(totalKvSize >= key.size());
 	ByteSampleInfo info;
 
-	const KeyRef key = keyValue.key;
-	info.size = key.size() + keyValue.value.size();
+	info.size = totalKvSize;
 
 	uint32_t a = 0;
 	uint32_t b = 0;
@@ -10339,12 +10354,14 @@ ACTOR Future<Void> waitMetrics(StorageServerMetrics* self, WaitMetricsRequest re
 						//  all the messages for one clear or set have been dispatched.
 
 						/*StorageMetrics m = getMetrics( data, req.keys );
-						  bool b = ( m.bytes != metrics.bytes || m.bytesPerKSecond != metrics.bytesPerKSecond ||
-						  m.iosPerKSecond != metrics.iosPerKSecond ); if (b) { printf("keys: '%s' - '%s' @%p\n",
+						  bool b = ( m.bytes != metrics.bytes || m.bytesWrittenPerKSecond !=
+						  metrics.bytesWrittenPerKSecond
+						  || m.iosPerKSecond != metrics.iosPerKSecond ); if (b) { printf("keys: '%s' - '%s' @%p\n",
 						  printable(req.keys.begin).c_str(), printable(req.keys.end).c_str(), this);
 						  printf("waitMetrics: desync %d (%lld %lld %lld) != (%lld %lld %lld); +(%lld %lld %lld)\n",
-						  b, m.bytes, m.bytesPerKSecond, m.iosPerKSecond, metrics.bytes, metrics.bytesPerKSecond,
-						  metrics.iosPerKSecond, c.bytes, c.bytesPerKSecond, c.iosPerKSecond);
+						  b, m.bytes, m.bytesWrittenPerKSecond, m.iosPerKSecond, metrics.bytes,
+						  metrics.bytesWrittenPerKSecond, metrics.iosPerKSecond, c.bytes, c.bytesWrittenPerKSecond,
+						  c.iosPerKSecond);
 
 						  }*/
 					}
